@@ -22,12 +22,12 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: AssemblyTitle("Тоннель FW — приложения только через VPN (брандмауэр Windows)")]
-[assembly: AssemblyDescription("Создаёт ярлыки и правила брандмауэра: приложение выходит в сеть только через VPN.")]
+[assembly: AssemblyTitle("Тоннель FW — приложения и правила брандмауэра")]
+[assembly: AssemblyDescription("Управление приложениями и правилами Windows Firewall: доступ в сеть только через VPN.")]
 [assembly: AssemblyProduct("Тоннель FW")]
 [assembly: AssemblyCopyright("")]
-[assembly: AssemblyVersion("2.1.0.0")]
-[assembly: AssemblyFileVersion("2.1.0.0")]
+[assembly: AssemblyVersion("3.0.0.0")]
+[assembly: AssemblyFileVersion("3.0.0.0")]
 
 public static class Program
 {
@@ -160,6 +160,124 @@ public static class Program
         }
     }
 
+    // ---- чтение, переключение и редактирование правил (версия 3) ----
+
+    // Чтение правил не требует повышения прав.
+    public static string RunPsRead(string body)
+    {
+        string ps1 = Path.Combine(Path.GetTempPath(), "tunnel-fw-r-" + Guid.NewGuid().ToString("N") + ".ps1");
+        File.WriteAllText(ps1, body, Encoding.UTF8);
+        try
+        {
+            var psi = new ProcessStartInfo("powershell.exe")
+            {
+                Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + ps1 + "\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            Process p = Process.Start(psi);
+            string output = p.StandardOutput.ReadToEnd();
+            p.StandardError.ReadToEnd();
+            p.WaitForExit(25000);
+            return output;
+        }
+        catch { return ""; }
+        finally { try { File.Delete(ps1); } catch { } }
+    }
+
+    static string Dec(string s)
+    {
+        try { return Encoding.UTF8.GetString(Convert.FromBase64String(s ?? "")); }
+        catch { return ""; }
+    }
+
+    public static List<FwRule> ReadFwRules()
+    {
+        const string script =
+@"function E([string]$s) { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$s)) }
+Get-NetFirewallRule -DisplayName 'TunnelFW-*' -ErrorAction SilentlyContinue | ForEach-Object {
+  $r = $_
+  $p = ''
+  try { $p = ($r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue).Program } catch {}
+  $a = @()
+  try { $a = @($r | Get-NetFirewallInterfaceFilter -ErrorAction SilentlyContinue | ForEach-Object { $_.InterfaceAlias }) } catch {}
+  [string]::Join(""`t"", @(
+    (E $r.DisplayName), (E $p), (E ([string]$r.Action)), (E ([string]$r.Enabled)),
+    (E ([string]::Join(';', $a))), (E ([string]$r.Description))
+  ))
+}";
+        var result = new List<FwRule>();
+        foreach (string line in RunPsRead(script).Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string[] f = line.Split('\t');
+            if (f.Length < 6) continue;
+            result.Add(new FwRule
+            {
+                Name = Dec(f[0]),
+                Program = Dec(f[1]),
+                Action = Dec(f[2]),
+                Enabled = string.Equals(Dec(f[3]), "True", StringComparison.OrdinalIgnoreCase),
+                Interfaces = Dec(f[4]).Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries),
+                Description = Dec(f[5])
+            });
+        }
+        return result;
+    }
+
+    public static string FirewallSetEnabledBody(string program, bool enabled)
+    {
+        string verb = enabled ? "Enable" : "Disable";
+        return verb + "-NetFirewallRule -DisplayName " + Ps(BlockName(program)) + " -ErrorAction SilentlyContinue\r\n" +
+               verb + "-NetFirewallRule -DisplayName " + Ps(AllowName(program)) + " -ErrorAction SilentlyContinue";
+    }
+
+    public static string FirewallDeleteRuleBody(string name)
+    {
+        return "Remove-NetFirewallRule -DisplayName " + Ps(name) + " -ErrorAction SilentlyContinue";
+    }
+
+    public static string FirewallEditRuleBody(FwRule old, string program, string action, string[] interfaces, bool enabled)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("Remove-NetFirewallRule -DisplayName " + Ps(old.Name) + " -ErrorAction SilentlyContinue");
+        sb.AppendLine("New-NetFirewallRule -DisplayName " + Ps(old.Name) +
+            " -Direction Outbound -Action " + (string.Equals(action, "Allow", StringComparison.OrdinalIgnoreCase) ? "Allow" : "Block") +
+            " -Program " + Ps(program) +
+            " -InterfaceAlias @(" + string.Join(",", interfaces.Select(Ps)) + ")" +
+            " -Profile Any -Enabled " + (enabled ? "True" : "False") +
+            " -Description " + Ps(old.Description) + " | Out-Null");
+        if (!string.Equals(program, old.Program, StringComparison.OrdinalIgnoreCase))
+        {
+            string other = old.Name.StartsWith("TunnelFW-B-")
+                ? "TunnelFW-A-" + old.Name.Substring(11) : "TunnelFW-B-" + old.Name.Substring(11);
+            sb.AppendLine("$o = Get-NetFirewallRule -DisplayName " + Ps(other) + " -ErrorAction SilentlyContinue");
+            sb.AppendLine("if ($o) {");
+            sb.AppendLine("  $oi = @($o | Get-NetFirewallInterfaceFilter -ErrorAction SilentlyContinue | ForEach-Object { $_.InterfaceAlias })");
+            sb.AppendLine("  $oa = [string]$o.Action; $od = [string]$o.Description; $oe = [string]$o.Enabled");
+            sb.AppendLine("  Remove-NetFirewallRule -DisplayName " + Ps(other) + " -ErrorAction SilentlyContinue");
+            sb.AppendLine("  New-NetFirewallRule -DisplayName " + Ps(other) + " -Direction Outbound -Action $oa -Program " + Ps(program) +
+                " -InterfaceAlias $oi -Profile Any -Enabled $oe -Description $od | Out-Null");
+            sb.AppendLine("}");
+        }
+        return sb.ToString();
+    }
+
+    public static void OpenFolder(string target)
+    {
+        try
+        {
+            if (target != null && target.StartsWith("shell:AppsFolder", StringComparison.OrdinalIgnoreCase))
+                Process.Start("explorer.exe", "shell:AppsFolder");
+            else if (Directory.Exists(target))
+                Process.Start("explorer.exe", "\"" + target + "\"");
+            else
+                Process.Start("explorer.exe", "/select,\"" + (target ?? "") + "\"");
+        }
+        catch { }
+    }
+
     public static bool IsExe(string t)
     {
         return !string.IsNullOrEmpty(t) && File.Exists(t) &&
@@ -289,6 +407,21 @@ class AppEntry
     public override string ToString() { return Name; }
 }
 
+// Одно правило брандмауэра, созданное Тоннель FW.
+public class FwRule
+{
+    public string Name;
+    public string Program;
+    public string Action;      // Block / Allow
+    public bool Enabled;
+    public string[] Interfaces;
+    public string Description;
+
+    public bool IsBlock { get { return string.Equals(Action, "Block", StringComparison.OrdinalIgnoreCase); } }
+    public string InterfaceText { get { return Interfaces == null ? "" : string.Join("; ", Interfaces); } }
+    public override string ToString() { return Name; }
+}
+
 // Цвета светлой и тёмной темы (по настройке Windows).
 class Theme
 {
@@ -324,6 +457,18 @@ class MainForm : Form
     readonly PictureBox pic = new PictureBox();
     readonly Label lblStatus = new Label(), lblTarget = new Label();
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 1000 };
+    readonly TabControl tabs = new TabControl();
+    readonly TabPage pageApps = new TabPage("Приложения");
+    readonly TabPage pageRules = new TabPage("Правила брандмауэра");
+    readonly ListBox lstRules = new ListBox();
+    readonly Label lblRulesStatus = new Label();
+    readonly TextBox txtRuleProgram = new TextBox(), txtRuleIfaces = new TextBox();
+    readonly ComboBox cmbRuleAction = new ComboBox(), cmbRuleVpn = new ComboBox();
+    readonly CheckBox chkRuleEnabled = new CheckBox();
+    Button btnToggleApp;
+
+    List<FwRule> rules = new List<FwRule>();
+    readonly Dictionary<string, List<FwRule>> rulesByProgram = new Dictionary<string, List<FwRule>>(StringComparer.OrdinalIgnoreCase);
 
     List<AppEntry> apps = new List<AppEntry>();
     readonly Dictionary<string, Bitmap> icons = new Dictionary<string, Bitmap>();
@@ -333,7 +478,7 @@ class MainForm : Form
 
     public MainForm()
     {
-        Text = Program.AppName + " — приложения только через VPN (брандмауэр)";
+        Text = Program.AppName + " — приложения и правила брандмауэра (v3)";
         Font = new Font("Segoe UI", 10f);
         ClientSize = new Size(460, 704);
         FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -381,11 +526,25 @@ class MainForm : Form
         pic.SetBounds(20, 462, 24, 24);
         pic.SizeMode = PictureBoxSizeMode.Zoom;
         Controls.Add(pic);
-        lblTarget.SetBounds(50, 464, 390, 22);
+        lblTarget.SetBounds(50, 464, 248, 22);
         lblTarget.ForeColor = th.Muted;
         lblTarget.AutoEllipsis = true;
         lblTarget.Text = "Ничего не выбрано";
         Controls.Add(lblTarget);
+
+        var btnFolder = FlatButton("Папка", false);
+        btnFolder.SetBounds(304, 460, 70, 30);
+        btnFolder.Font = new Font("Segoe UI", 9f);
+        new ToolTip().SetToolTip(btnFolder, "Открыть папку выбранного приложения");
+        btnFolder.Click += delegate { OpenAppFolder(); };
+        Controls.Add(btnFolder);
+
+        btnToggleApp = FlatButton("Вкл/Выкл", false);
+        btnToggleApp.SetBounds(380, 460, 60, 30);
+        btnToggleApp.Font = new Font("Segoe UI", 9f);
+        new ToolTip().SetToolTip(btnToggleApp, "Включить или выключить ограничение брандмауэра для приложения");
+        btnToggleApp.Click += delegate { ToggleAppRestriction(); };
+        Controls.Add(btnToggleApp);
 
         Input(txtName, 20, 496, 420, "Название ярлыка");
 
@@ -442,7 +601,7 @@ class MainForm : Form
         lst.SelectedIndexChanged += delegate
         {
             var a = lst.SelectedItem as AppEntry;
-            if (a != null) SetTarget(a.Target, a.Name);
+            if (a != null) { SetTarget(a.Target, a.Name); RefreshToggleButton(); }
         };
         txtUrl.TextChanged += delegate
         {
@@ -457,10 +616,31 @@ class MainForm : Form
                 {
                     string desc = FileVersionInfo.GetVersionInfo(dlg.FileName).FileDescription;
                     SetTarget(dlg.FileName, string.IsNullOrWhiteSpace(desc) ? Path.GetFileNameWithoutExtension(dlg.FileName) : desc);
+                    RefreshToggleButton();
                 }
         };
         btnCreate.Click += delegate { Create(); };
         Shown += delegate { cmbVpn.Select(0, 0); txtSearch.Focus(); };
+
+        // ---- вкладки (версия 3): всё существующее содержимое становится первой вкладкой ----
+        pageApps.BackColor = th.Back;
+        var holder = new Panel { Dock = DockStyle.Fill, BackColor = th.Back };
+        foreach (var c in Controls.Cast<Control>().ToList()) holder.Controls.Add(c);
+        pageApps.Controls.Add(holder);
+
+        BuildRulesPage();
+        tabs.Dock = DockStyle.Fill;
+        tabs.Controls.Add(pageApps);
+        tabs.Controls.Add(pageRules);
+        Controls.Add(tabs);
+        tabs.SelectedIndexChanged += delegate
+        {
+            if (tabs.SelectedTab == pageRules) LoadRules();
+            else RefreshToggleButton();
+        };
+
+        LoadRules();
+        RefreshToggleButton();
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -568,11 +748,31 @@ class MainForm : Form
                 list.Add(new AppEntry { Name = item.Name, Target = "shell:AppsFolder\\" + item.Path });
         }
         catch { } // список не загрузился: остаются .exe и ссылка
+        AddRuleApps(list);
         list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase));
         if (list.Select(a => a.Target).SequenceEqual(apps.Select(a => a.Target))) return; // ничего не изменилось
         apps = list;
         Filter();
         LoadIconsAsync();
+    }
+
+    // Приложения с правилами TunnelFW должны быть видны, даже если их нет в меню «Пуск».
+    void AddRuleApps(List<AppEntry> list)
+    {
+        foreach (var kv in rulesByProgram)
+        {
+            if (!kv.Key.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) continue;
+            if (list.Any(a => string.Equals(a.Target, kv.Key, StringComparison.OrdinalIgnoreCase))) continue;
+            string name = "";
+            try
+            {
+                var vi = FileVersionInfo.GetVersionInfo(kv.Key);
+                name = vi.FileDescription;
+            }
+            catch { }
+            if (string.IsNullOrWhiteSpace(name)) name = Path.GetFileNameWithoutExtension(kv.Key);
+            list.Add(new AppEntry { Name = name, Target = kv.Key });
+        }
     }
 
     void Filter()
@@ -632,6 +832,13 @@ class MainForm : Form
         var r = new Rectangle(e.Bounds.X + 46, e.Bounds.Y, e.Bounds.Width - 52, e.Bounds.Height);
         TextRenderer.DrawText(e.Graphics, a.Name, lst.Font, r, th.Text,
             TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        var rr = RulesFor(a.Target);
+        if (rr != null && rr.Count > 0)
+        {
+            bool anyOn = rr.Any(x => x.Enabled);
+            using (var br = new SolidBrush(anyOn ? th.Accent : th.Bad))
+                e.Graphics.FillEllipse(br, e.Bounds.Right - 17, e.Bounds.Y + 14, 10, 10);
+        }
     }
 
     void SetTarget(string t, string name)
@@ -684,6 +891,7 @@ class MainForm : Form
                       "». Без VPN соединения нет, даже при прямом запуске .exe."
                     : "\n\nВНИМАНИЕ: не удалось создать правила брандмауэра (" + res + "). Ярлык создан, но жёсткой блокировки нет.";
             }
+            if (fw) LoadRules();
             MessageBox.Show(this, msg, Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception ex) { Warn("Не удалось создать ярлык: " + ex.Message); }
@@ -693,11 +901,297 @@ class MainForm : Form
     {
         if (!Program.IsExe(target)) { Warn("Сначала выберите программу .exe через «Выбрать .exe…»."); return; }
         string res = Program.RunPs(Program.FirewallRemoveBody(target));
+        if (res == "OK") LoadRules();
         MessageBox.Show(this, res == "OK"
                 ? "Правила брандмауэра для «" + Path.GetFileName(target) + "» удалены."
                 : "Не удалось удалить правила: " + res,
             Program.AppName, MessageBoxButtons.OK,
             res == "OK" ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+    }
+
+    // ---- вкладка «Правила брандмауэра» (версия 3) ----
+
+    void BuildRulesPage()
+    {
+        pageRules.BackColor = th.Back;
+        Action<Control, int, int, int, int> put = (c, x, y, w, h) => { c.SetBounds(x, y, w, h); pageRules.Controls.Add(c); };
+
+        var head = new Label { Text = "Правила Тоннель FW", AutoSize = false, ForeColor = th.Text,
+            Font = new Font("Segoe UI Semibold", 14f) };
+        put(head, 18, 10, 300, 26);
+        lblRulesStatus.ForeColor = th.Muted;
+        lblRulesStatus.Font = new Font("Segoe UI", 9f);
+        put(lblRulesStatus, 20, 40, 420, 20);
+
+        var frame = FrameOn(pageRules, 20, 66, 420, 214);
+        lstRules.BorderStyle = BorderStyle.None;
+        lstRules.BackColor = th.Surface;
+        lstRules.ForeColor = th.Text;
+        lstRules.DrawMode = DrawMode.OwnerDrawFixed;
+        lstRules.ItemHeight = 34;
+        lstRules.IntegralHeight = false;
+        lstRules.SetBounds(1, 1, 418, 212);
+        frame.Controls.Add(lstRules);
+        lstRules.DrawItem += DrawRule;
+        lstRules.SelectedIndexChanged += delegate { FillRuleEdit(lstRules.SelectedItem as FwRule); };
+
+        var bRefresh = FlatButton("⟳", false); bRefresh.Font = new Font("Segoe UI", 12f);
+        new ToolTip().SetToolTip(bRefresh, "Обновить список правил");
+        bRefresh.Click += delegate { LoadRules(); };
+        put(bRefresh, 20, 286, 36, 30);
+
+        var bOn = FlatButton("Включить", false); bOn.Font = new Font("Segoe UI", 9f);
+        bOn.Click += delegate { ToggleSelectedRule(true); };
+        put(bOn, 62, 286, 100, 30);
+
+        var bOff = FlatButton("Выключить", false); bOff.Font = new Font("Segoe UI", 9f);
+        bOff.Click += delegate { ToggleSelectedRule(false); };
+        put(bOff, 168, 286, 100, 30);
+
+        var bDel = FlatButton("Удалить", false); bDel.Font = new Font("Segoe UI", 9f);
+        bDel.Click += delegate { DeleteRule(); };
+        put(bDel, 274, 286, 100, 30);
+
+        var bDir = FlatButton("Папка", false); bDir.Font = new Font("Segoe UI", 9f);
+        new ToolTip().SetToolTip(bDir, "Открыть папку программы выбранного правила");
+        bDir.Click += delegate
+        {
+            var r = lstRules.SelectedItem as FwRule;
+            if (r != null) Program.OpenFolder(r.Program);
+        };
+        put(bDir, 380, 286, 60, 30);
+
+        var editHead = new Label { Text = "Редактирование выбранного правила", ForeColor = th.Text,
+            Font = new Font("Segoe UI Semibold", 10f) };
+        put(editHead, 20, 324, 420, 22);
+
+        var lblProg = new Label { Text = "Программа (.exe)", ForeColor = th.Muted, Font = new Font("Segoe UI", 9f) };
+        put(lblProg, 20, 348, 300, 18);
+        var pf = FrameOn(pageRules, 20, 368, 420, 36);
+        txtRuleProgram.BorderStyle = BorderStyle.None;
+        txtRuleProgram.BackColor = th.Surface; txtRuleProgram.ForeColor = th.Text;
+        txtRuleProgram.Font = new Font("Segoe UI", 9f);
+        txtRuleProgram.SetBounds(10, 8, 338, 22);
+        pf.Controls.Add(txtRuleProgram);
+        var bBrowse = FlatButton("…", false);
+        bBrowse.Font = new Font("Segoe UI", 12f);
+        bBrowse.SetBounds(356, 3, 60, 30);
+        bBrowse.Click += delegate
+        {
+            using (var dlg = new OpenFileDialog { Filter = "Программы (*.exe)|*.exe" })
+                if (dlg.ShowDialog(this) == DialogResult.OK) txtRuleProgram.Text = dlg.FileName;
+        };
+        pf.Controls.Add(bBrowse);
+
+        put(new Label { Text = "Действие", ForeColor = th.Muted, Font = new Font("Segoe UI", 9f) }, 20, 412, 110, 18);
+        put(new Label { Text = "VPN-адаптер", ForeColor = th.Muted, Font = new Font("Segoe UI", 9f) }, 140, 412, 160, 18);
+        cmbRuleAction.Items.AddRange(new object[] { "Block", "Allow" });
+        cmbRuleAction.DropDownStyle = ComboBoxStyle.DropDownList;
+        cmbRuleAction.FlatStyle = FlatStyle.Flat;
+        cmbRuleAction.BackColor = th.Surface; cmbRuleAction.ForeColor = th.Text;
+        cmbRuleAction.Font = new Font("Segoe UI", 9f);
+        put(cmbRuleAction, 20, 432, 112, 28);
+
+        FillAdaptersInto(cmbRuleVpn);
+        cmbRuleVpn.FlatStyle = FlatStyle.Flat;
+        cmbRuleVpn.BackColor = th.Surface; cmbRuleVpn.ForeColor = th.Text;
+        cmbRuleVpn.Font = new Font("Segoe UI", 9f);
+        put(cmbRuleVpn, 140, 432, 160, 28);
+
+        chkRuleEnabled.Text = "Правило включено";
+        chkRuleEnabled.ForeColor = th.Text;
+        chkRuleEnabled.FlatStyle = FlatStyle.Flat;
+        chkRuleEnabled.Font = new Font("Segoe UI", 9f);
+        put(chkRuleEnabled, 308, 434, 132, 24);
+
+        put(new Label { Text = "Интерфейсы (через ';')", ForeColor = th.Muted, Font = new Font("Segoe UI", 9f) }, 20, 466, 300, 18);
+        var ff = FrameOn(pageRules, 20, 486, 420, 36);
+        txtRuleIfaces.BorderStyle = BorderStyle.None;
+        txtRuleIfaces.BackColor = th.Surface; txtRuleIfaces.ForeColor = th.Text;
+        txtRuleIfaces.Font = new Font("Segoe UI", 9f);
+        txtRuleIfaces.SetBounds(10, 8, 400, 22);
+        ff.Controls.Add(txtRuleIfaces);
+
+        var bApply = FlatButton("Применить изменения", true);
+        bApply.Font = new Font("Segoe UI", 9f);
+        bApply.Click += delegate { ApplyRuleEdit(); };
+        put(bApply, 20, 532, 200, 38);
+
+        var bReset = FlatButton("Сбросить", false);
+        bReset.Font = new Font("Segoe UI", 9f);
+        bReset.Click += delegate { FillRuleEdit(lstRules.SelectedItem as FwRule); };
+        put(bReset, 230, 532, 210, 38);
+
+        var hint = new Label
+        {
+            Text = "Изменения применяются к выбранному правилу. При смене пути .exe парное правило обновляется автоматически. " +
+                   "Чтобы снять ограничение полностью, используйте «Удалить правила» на вкладке «Приложения».",
+            ForeColor = th.Muted, Font = new Font("Segoe UI", 8.5f)
+        };
+        put(hint, 20, 580, 420, 54);
+    }
+
+    Panel FrameOn(Control parent, int x, int y, int w, int h)
+    {
+        var p = new Panel { BackColor = th.Surface };
+        p.SetBounds(x, y, w, h);
+        p.Paint += (s, e) => { using (var pen = new Pen(th.Border)) e.Graphics.DrawRectangle(pen, 0, 0, p.Width - 1, p.Height - 1); };
+        parent.Controls.Add(p);
+        return p;
+    }
+
+    void FillAdaptersInto(ComboBox cb)
+    {
+        cb.Items.Clear();
+        cb.Items.Add("— не менять —");
+        foreach (var n in NetworkInterface.GetAllNetworkInterfaces())
+            if (n.NetworkInterfaceType != NetworkInterfaceType.Loopback && !cb.Items.Contains(n.Name)) cb.Items.Add(n.Name);
+        cb.SelectedIndex = 0;
+    }
+
+    void LoadRules()
+    {
+        rules = Program.ReadFwRules();
+        rulesByProgram.Clear();
+        foreach (var r in rules)
+            if (!string.IsNullOrEmpty(r.Program))
+            {
+                List<FwRule> list;
+                if (!rulesByProgram.TryGetValue(r.Program, out list)) rulesByProgram[r.Program] = list = new List<FwRule>();
+                list.Add(r);
+            }
+        LoadApps(); // подтянуть .exe, которых нет в меню «Пуск», но у которых есть правила
+        RefreshRulesList();
+        RefreshToggleButton();
+    }
+
+    void RefreshRulesList()
+    {
+        var cur = lstRules.SelectedItem as FwRule;
+        lstRules.BeginUpdate();
+        lstRules.Items.Clear();
+        foreach (var r in rules) lstRules.Items.Add(r);
+        if (cur != null)
+            for (int i = 0; i < lstRules.Items.Count; i++)
+                if (((FwRule)lstRules.Items[i]).Name == cur.Name) { lstRules.SelectedIndex = i; break; }
+        if (lstRules.SelectedIndex < 0 && lstRules.Items.Count > 0) lstRules.SelectedIndex = 0;
+        lstRules.EndUpdate();
+        int on = rules.Count(r => r.Enabled);
+        lblRulesStatus.Text = rules.Count == 0
+            ? "Правил нет — создайте ярлык с ограничением на вкладке «Приложения»."
+            : "Всего: " + rules.Count + "   ·   включено: " + on + "   ·   выключено: " + (rules.Count - on);
+    }
+
+    void DrawRule(object sender, DrawItemEventArgs e)
+    {
+        if (e.Index < 0) return;
+        var r = (FwRule)lstRules.Items[e.Index];
+        bool sel = (e.State & DrawItemState.Selected) != 0;
+        using (var b = new SolidBrush(sel ? th.Select : th.Surface)) e.Graphics.FillRectangle(b, e.Bounds);
+        using (var br = new SolidBrush(r.IsBlock ? th.Bad : th.Accent))
+            e.Graphics.FillRectangle(br, e.Bounds.X + 8, e.Bounds.Y + 10, 13, 13);
+        string prog = string.IsNullOrEmpty(r.Program) ? "?" : Path.GetFileName(r.Program);
+        TextRenderer.DrawText(e.Graphics, prog + "   ·   " + r.Action, lstRules.Font,
+            new Rectangle(e.Bounds.X + 28, e.Bounds.Y + 1, e.Bounds.Width - 34, 17),
+            r.Enabled ? th.Text : th.Muted, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        string sub = (r.Enabled ? "вкл" : "ВЫКЛ") + "   ·   " + r.InterfaceText + "   ·   " + r.Name;
+        TextRenderer.DrawText(e.Graphics, sub, new Font("Segoe UI", 8f),
+            new Rectangle(e.Bounds.X + 28, e.Bounds.Y + 17, e.Bounds.Width - 34, 16),
+            th.Muted, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+    }
+
+    void FillRuleEdit(FwRule r)
+    {
+        if (r == null)
+        {
+            txtRuleProgram.Text = ""; txtRuleIfaces.Text = "";
+            cmbRuleAction.SelectedIndex = 0;
+            cmbRuleVpn.SelectedIndex = 0;
+            chkRuleEnabled.Checked = false;
+            return;
+        }
+        txtRuleProgram.Text = r.Program ?? "";
+        txtRuleIfaces.Text = r.InterfaceText;
+        cmbRuleAction.SelectedItem = r.IsBlock ? "Block" : "Allow";
+        cmbRuleVpn.SelectedIndex = 0;
+        chkRuleEnabled.Checked = r.Enabled;
+    }
+
+    void ApplyRuleEdit()
+    {
+        var r = lstRules.SelectedItem as FwRule;
+        if (r == null) { Warn("Сначала выберите правило в списке."); return; }
+        string prog = txtRuleProgram.Text.Trim();
+        if (!Program.IsExe(prog)) { Warn("Укажите существующий .exe."); return; }
+        string action = cmbRuleAction.SelectedItem as string ?? "Block";
+        string[] ifaces;
+        string vpn = cmbRuleVpn.SelectedItem as string;
+        if (!string.IsNullOrEmpty(vpn) && !vpn.StartsWith("—"))
+            ifaces = new[] { vpn };
+        else
+            ifaces = txtRuleIfaces.Text.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => s.Trim()).Where(s => s.Length > 0).ToArray();
+        if (ifaces.Length == 0) { Warn("Укажите хотя бы один сетевой адаптер."); return; }
+        string res = Program.RunPs(Program.FirewallEditRuleBody(r, prog, action, ifaces, chkRuleEnabled.Checked));
+        if (res == "OK") { LoadRules(); FillRuleEdit(lstRules.SelectedItem as FwRule); }
+        else Warn("Не удалось изменить правило: " + res);
+    }
+
+    void ToggleSelectedRule(bool on)
+    {
+        var r = lstRules.SelectedItem as FwRule;
+        if (r == null) { Warn("Сначала выберите правило в списке."); return; }
+        string res = Program.RunPs(Program.FirewallEditRuleBody(r, r.Program, r.Action, r.Interfaces, on));
+        if (res == "OK") LoadRules();
+        else Warn("Не удалось переключить правило: " + res);
+    }
+
+    void DeleteRule()
+    {
+        var r = lstRules.SelectedItem as FwRule;
+        if (r == null) { Warn("Сначала выберите правило в списке."); return; }
+        if (MessageBox.Show(this, "Удалить правило «" + r.Name + "»?", Program.AppName,
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        string res = Program.RunPs(Program.FirewallDeleteRuleBody(r.Name));
+        if (res == "OK") LoadRules();
+        else Warn("Не удалось удалить правило: " + res);
+    }
+
+    // ---- первая вкладка: приложения ----
+
+    List<FwRule> RulesFor(string t)
+    {
+        List<FwRule> list;
+        return t != null && rulesByProgram.TryGetValue(t, out list) ? list : null;
+    }
+
+    void RefreshToggleButton()
+    {
+        if (btnToggleApp == null) return;
+        var list = RulesFor(target);
+        btnToggleApp.Enabled = list != null && list.Count > 0;
+        btnToggleApp.Text = list != null && list.Any(r => r.Enabled) ? "Выкл." : "Вкл.";
+    }
+
+    void ToggleAppRestriction()
+    {
+        var list = RulesFor(target);
+        if (list == null || list.Count == 0)
+        {
+            Warn("У выбранного приложения нет правил Тоннель FW.\n" +
+                 "Создайте для него ярлык с включённым ограничением на этой вкладке.");
+            return;
+        }
+        bool enable = !list.Any(r => r.Enabled);
+        string res = Program.RunPs(Program.FirewallSetEnabledBody(target, enable));
+        if (res == "OK") { LoadRules(); RefreshToggleButton(); }
+        else Warn("Не удалось переключить ограничение: " + res);
+    }
+
+    void OpenAppFolder()
+    {
+        if (target == null) { Warn("Сначала выберите приложение."); return; }
+        Program.OpenFolder(target);
     }
 
     void Warn(string m) { MessageBox.Show(this, m, Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning); }
