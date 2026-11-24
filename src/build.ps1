@@ -45,5 +45,5 @@ foreach ($p in $pngs) { $w.Write($p) }
 
 & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /codepage:65001 /target:winexe /optimize `
     "/win32icon:$src\TunnelFW.ico" "/out:$out\TunnelFW.exe" `
-    /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:Microsoft.CSharp.dll /r:System.Core.dll "$src\TunnelFW.cs"
+    /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:Microsoft.CSharp.dll /r:System.Core.dll "$src\*.cs"
 "exit: $LASTEXITCODE"
