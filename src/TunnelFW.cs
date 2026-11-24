@@ -26,8 +26,8 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("Управление приложениями и правилами Windows Firewall: доступ в сеть только через VPN.")]
 [assembly: AssemblyProduct("Тоннель FW")]
 [assembly: AssemblyCopyright("")]
-[assembly: AssemblyVersion("3.0.0.0")]
-[assembly: AssemblyFileVersion("3.0.0.0")]
+[assembly: AssemblyVersion("3.0.1.0")]
+[assembly: AssemblyFileVersion("3.0.1.0")]
 
 public static class Program
 {
@@ -37,9 +37,10 @@ public static class Program
     static int Main(string[] args)
     {
         if (args.Length == 2) return Gate(args[0], args[1]);
+        bool rules = args.Length == 1 && string.Equals(args[0], "--rules", StringComparison.OrdinalIgnoreCase);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Application.Run(new MainForm());
+        Application.Run(new MainForm(rules));
         return 0;
     }
 
@@ -422,50 +423,581 @@ public class FwRule
     public override string ToString() { return Name; }
 }
 
-// Цвета светлой и тёмной темы (по настройке Windows).
+// Цвета: минимализм, чёрный и красный.
 class Theme
 {
-    public Color Back, Surface, Text, Muted, Border, Accent, AccentHover, Select, Bad;
-    public bool Dark;
+    public Color Back, Surface, SurfaceHover, Text, Muted, Border, Accent, AccentHover, AccentDim, Select, Bad;
+    public bool Dark = true;
 
     public static Theme Current()
     {
-        object v = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme", 1);
-        bool dark = v is int && (int)v == 0;
-        var t = new Theme { Dark = dark, Accent = Color.FromArgb(22, 163, 74), AccentHover = Color.FromArgb(21, 128, 61), Bad = Color.FromArgb(220, 38, 38) };
-        if (dark)
+        return new Theme
         {
-            t.Back = Color.FromArgb(32, 32, 32); t.Surface = Color.FromArgb(43, 43, 43); t.Text = Color.FromArgb(242, 242, 242);
-            t.Muted = Color.FromArgb(160, 160, 160); t.Border = Color.FromArgb(64, 64, 64); t.Select = Color.FromArgb(28, 70, 45);
-        }
-        else
-        {
-            t.Back = Color.FromArgb(247, 247, 248); t.Surface = Color.White; t.Text = Color.FromArgb(24, 24, 27);
-            t.Muted = Color.FromArgb(113, 113, 122); t.Border = Color.FromArgb(228, 228, 231); t.Select = Color.FromArgb(220, 252, 231);
-        }
-        return t;
+            Dark = true,
+            Back = Color.FromArgb(10, 10, 10),
+            Surface = Color.FromArgb(20, 20, 20),
+            SurfaceHover = Color.FromArgb(30, 30, 30),
+            Text = Color.FromArgb(242, 242, 242),
+            Muted = Color.FromArgb(138, 138, 138),
+            Border = Color.FromArgb(40, 40, 40),
+            Accent = Color.FromArgb(225, 29, 46),
+            AccentHover = Color.FromArgb(255, 51, 68),
+            AccentDim = Color.FromArgb(74, 12, 18),
+            Select = Color.FromArgb(58, 12, 18),
+            Bad = Color.FromArgb(225, 29, 46)
+        };
     }
 }
 
-class MainForm : Form
+// ---- оформление: анимации, курсор, переключатели ----
+
+static class Ui
+{
+    public static Cursor Arrow, Hand;
+    public static bool Effects = true;
+
+    public static void InitCursors()
+    {
+        if (Arrow != null) return;
+        try { Arrow = BuildCursor(false); } catch { Arrow = Cursors.Default; }
+        try { Hand = BuildCursor(true); } catch { Hand = Cursors.Hand; }
+    }
+
+    static Cursor BuildCursor(bool hand)
+    {
+        int s = 32;
+        using (var bmp = new Bitmap(s, s, PixelFormat.Format32bppArgb))
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.Clear(Color.Transparent);
+            PointF[] pts = hand
+                ? new[] { new PointF(11, 29), new PointF(11, 9), new PointF(14, 6), new PointF(17, 9), new PointF(17, 16),
+                          new PointF(19, 14), new PointF(22, 17), new PointF(22, 26), new PointF(18, 30) }
+                : new[] { new PointF(4, 2), new PointF(4, 25), new PointF(10, 19), new PointF(14, 29),
+                          new PointF(19, 27), new PointF(15, 17), new PointF(23, 16) };
+            // тень
+            using (var sh = new SolidBrush(Color.FromArgb(170, 0, 0, 0)))
+            {
+                var shadow = pts.Select(p => new PointF(p.X + 1.4f, p.Y + 1.4f)).ToArray();
+                g.FillPolygon(sh, shadow);
+            }
+            using (var fill = new SolidBrush(Color.White))
+            using (var pen = new Pen(Color.FromArgb(225, 29, 46), 1.6f) { LineJoin = LineJoin.Round })
+            {
+                g.FillPolygon(fill, pts);
+                g.DrawPolygon(pen, pts);
+            }
+            int hotX = hand ? 14 : 4, hotY = hand ? 8 : 2;
+            return IconFromBitmap(bmp, hotX, hotY);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct ICONINFO { public bool fIcon; public int xHotspot; public int yHotspot; public IntPtr hbmMask; public IntPtr hbmColor; }
+
+    [DllImport("user32.dll")] static extern IntPtr CreateIconIndirect(ref ICONINFO piconinfo);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr hObject);
+
+    static Cursor IconFromBitmap(Bitmap bmp, int hotX, int hotY)
+    {
+        int w = bmp.Width, h = bmp.Height;
+        IntPtr hColor = bmp.GetHbitmap(Color.FromArgb(0));
+        IntPtr hMask = IntPtr.Zero;
+        Bitmap mask = new Bitmap(w, h, PixelFormat.Format1bppIndexed);
+        try
+        {
+            var data = mask.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format1bppIndexed);
+            try
+            {
+                int stride = data.Stride;
+                byte[] row = new byte[Math.Abs(stride)];
+                for (int y = 0; y < h; y++)
+                {
+                    Array.Clear(row, 0, row.Length);
+                    for (int x = 0; x < w; x++)
+                        if (bmp.GetPixel(x, y).A == 0)
+                            row[x >> 3] |= (byte)(0x80 >> (x & 7));
+                    Marshal.Copy(row, 0, new IntPtr(data.Scan0.ToInt64() + y * stride), row.Length);
+                }
+            }
+            finally { mask.UnlockBits(data); }
+            hMask = mask.GetHbitmap(Color.FromArgb(0));
+            var ii = new ICONINFO { fIcon = false, xHotspot = hotX, yHotspot = hotY, hbmMask = hMask, hbmColor = hColor };
+            IntPtr hIcon = CreateIconIndirect(ref ii);
+            return new Cursor(hIcon);
+        }
+        finally
+        {
+            if (hMask != IntPtr.Zero) DeleteObject(hMask);
+            DeleteObject(hColor);
+            mask.Dispose();
+        }
+    }
+
+    public static GraphicsPath Round(Rectangle r, int radius)
+    {
+        int d = radius * 2;
+        var p = new GraphicsPath();
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
+    }
+}
+
+// Кнопка с анимацией наведения, нажатия и «волной» по клику.
+class AnimButton : Button
+{
+    readonly Theme th;
+    readonly bool primary;
+    readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 15 };
+    float hover, press, ripple, rippleR;
+    Point ripplePt;
+    bool rippleOn;
+
+    public AnimButton(Theme theme, bool isPrimary)
+    {
+        th = theme;
+        primary = isPrimary;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor |
+                 ControlStyles.ResizeRedraw, true);
+        FlatStyle = FlatStyle.Flat;
+        FlatAppearance.BorderSize = 0;
+        BackColor = Color.Transparent;
+        ForeColor = theme.Text;
+        Cursor = Ui.Hand;
+        timer.Tick += delegate
+        {
+            bool busy = false;
+            if (hover < 1 && hoverOn) { hover = Math.Min(1, hover + 0.16f); busy = true; }
+            if (hover > 0 && !hoverOn) { hover = Math.Max(0, hover - 0.16f); busy = true; }
+            if (pressOn) { press = Math.Min(1, press + 0.25f); busy = true; }
+            else if (press > 0) { press = Math.Max(0, press - 0.3f); busy = true; }
+            if (rippleOn)
+            {
+                rippleR += 9f; ripple -= 0.045f; busy = true;
+                if (ripple <= 0) rippleOn = false;
+            }
+            Invalidate();
+            if (!busy) timer.Stop();
+        };
+    }
+
+    bool hoverOn, pressOn;
+    protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hoverOn = true; timer.Start(); }
+    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hoverOn = false; pressOn = false; timer.Start(); }
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        pressOn = true;
+        if (Enabled && e.Button == MouseButtons.Left)
+        {
+            ripplePt = e.Location; rippleR = 2; ripple = 0.9f; rippleOn = true;
+        }
+        timer.Start();
+    }
+    protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); pressOn = false; timer.Start(); }
+    protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Invalidate(); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.Clear(Parent != null ? Parent.BackColor : th.Back);
+
+        int shrink = (int)(press * 2);
+        var r = new Rectangle(shrink, shrink, Width - 1 - shrink * 2, Height - 1 - shrink * 2);
+        if (r.Width <= 0 || r.Height <= 0) return;
+        int radius = Math.Min(9, r.Height / 2);
+
+        Color fill = primary
+            ? Blend(th.Accent, th.AccentHover, hover)
+            : Blend(th.Surface, th.SurfaceHover, hover);
+        if (!Enabled) fill = Blend(th.Surface, th.Back, 0.5f);
+
+        using (var path = Ui.Round(r, radius))
+        {
+            if (primary && Enabled && hover > 0.02f)
+                using (var glow = new Pen(Color.FromArgb((int)(70 * hover), th.Accent), 2f))
+                    g.DrawPath(glow, path);
+            using (var b = new SolidBrush(fill)) g.FillPath(b, path);
+            Color border = primary ? fill : Blend(th.Border, th.Accent, hover * 0.9f);
+            using (var p = new Pen(border, primary ? 0f : 1f)) if (!primary) g.DrawPath(p, path);
+
+            if (rippleOn)
+            {
+                g.SetClip(path);
+                using (var rb = new SolidBrush(Color.FromArgb((int)(70 * Math.Max(0, ripple)), Color.White)))
+                    g.FillEllipse(rb, ripplePt.X - rippleR, ripplePt.Y - rippleR, rippleR * 2, rippleR * 2);
+                g.ResetClip();
+            }
+        }
+
+        Color text = !Enabled ? th.Muted : (primary ? Color.White : Blend(th.Text, Color.White, hover * 0.5f));
+        TextRenderer.DrawText(g, Text, Font, r, text,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+    }
+
+    static Color Blend(Color a, Color b, float t)
+    {
+        t = Math.Max(0, Math.Min(1, t));
+        return Color.FromArgb(
+            (int)(a.R + (b.R - a.R) * t),
+            (int)(a.G + (b.G - a.G) * t),
+            (int)(a.B + (b.B - a.B) * t));
+    }
+}
+
+// Переключатель-пилюля с анимированным бегунком.
+class ToggleSwitch : CheckBox
+{
+    readonly Theme th;
+    readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 15 };
+    float pos;
+
+    public ToggleSwitch(Theme theme)
+    {
+        th = theme;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor |
+                 ControlStyles.ResizeRedraw, true);
+        FlatStyle = FlatStyle.Flat;
+        BackColor = Color.Transparent;
+        ForeColor = theme.Text;
+        Cursor = Ui.Hand;
+        timer.Tick += delegate
+        {
+            float want = Checked ? 1f : 0f;
+            if (Math.Abs(pos - want) < 0.03f) { pos = want; timer.Stop(); }
+            else pos += (want - pos) * 0.28f;
+            Invalidate();
+        };
+    }
+
+    protected override void OnCheckedChanged(EventArgs e)
+    {
+        base.OnCheckedChanged(e);
+        timer.Start();
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.Clear(Parent != null ? Parent.BackColor : th.Back);
+
+        int h = 20, w = 38, y = (Height - h) / 2;
+        var track = new Rectangle(1, y, w, h);
+        Color off = Color.FromArgb(55, 55, 55);
+        Color on = th.Accent;
+        Color trackColor = Color.FromArgb(
+            (int)(off.R + (on.R - off.R) * pos),
+            (int)(off.G + (on.G - off.G) * pos),
+            (int)(off.B + (on.B - off.B) * pos));
+        using (var path = Ui.Round(track, h / 2))
+        using (var b = new SolidBrush(trackColor)) g.FillPath(b, path);
+
+        int knob = h - 6;
+        float kx = track.X + 3 + (w - knob - 6) * pos;
+        using (var kb = new SolidBrush(Color.White))
+            g.FillEllipse(kb, kx, y + 3, knob, knob);
+
+        int tx = w + 10;
+        var tr = new Rectangle(tx, 0, Width - tx, Height);
+        TextRenderer.DrawText(g, Text, Font, tr, Enabled ? th.Text : th.Muted,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+    }
+}
+
+
+// Кастомная полоса вкладок с анимированным красным подчёркиванием.
+class TabStrip : Control
+{
+    readonly Theme th;
+    public string[] Titles = new string[0];
+    int selected, hoverIndex = -1;
+    float underX = -1, underTarget;
+    readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 15 };
+    Rectangle[] rects = new Rectangle[0];
+
+    public TabStrip(Theme theme)
+    {
+        th = theme;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor |
+                 ControlStyles.ResizeRedraw, true);
+        BackColor = theme.Back;
+        ForeColor = theme.Text;
+        Font = new Font("Segoe UI Semibold", 10f);
+        Cursor = Ui.Hand;
+        Height = 42;
+        timer.Tick += delegate
+        {
+            if (underX < 0) underX = underTarget;
+            float d = underTarget - underX;
+            if (Math.Abs(d) < 0.6f) { underX = underTarget; timer.Stop(); }
+            else underX += d * 0.28f;
+            Invalidate();
+        };
+    }
+
+    public event EventHandler SelectedChanged;
+
+    public int SelectedIndex
+    {
+        get { return selected; }
+        set
+        {
+            if (value == selected || value < 0 || value >= Titles.Length) return;
+            selected = value;
+            underTarget = TabCenter(value);
+            if (underX < 0) underX = underTarget;
+            timer.Start();
+            Invalidate();
+            if (SelectedChanged != null) SelectedChanged(this, EventArgs.Empty);
+        }
+    }
+
+    float TabCenter(int i)
+    {
+        float x = 16;
+        for (int k = 0; k < i; k++) x += WidthOf(k) + 28;
+        return x + WidthOf(i) / 2f;
+    }
+
+    int WidthOf(int i) { return TextRenderer.MeasureText(Titles[i], Font).Width; }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        int h = Hit(e.X, e.Y);
+        if (h != hoverIndex) { hoverIndex = h; Invalidate(); }
+    }
+
+    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hoverIndex = -1; Invalidate(); }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        int h = Hit(e.X, e.Y);
+        if (h >= 0) SelectedIndex = h;
+    }
+
+    int Hit(int x, int y)
+    {
+        for (int i = 0; i < rects.Length; i++)
+            if (rects[i].Contains(x, y)) return i;
+        return -1;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+        g.Clear(th.Back);
+        using (var pen = new Pen(th.Border)) g.DrawLine(pen, 0, Height - 1, Width, Height - 1);
+
+        rects = new Rectangle[Titles.Length];
+        float x = 16;
+        for (int i = 0; i < Titles.Length; i++)
+        {
+            int w = WidthOf(i);
+            rects[i] = new Rectangle((int)x, 0, w, Height - 1);
+            Color c = i == selected ? th.Text : (i == hoverIndex ? Color.FromArgb(200, 200, 200) : th.Muted);
+            TextRenderer.DrawText(g, Titles[i], Font, rects[i], c,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            x += w + 28;
+        }
+
+        if (underX < 0) underX = TabCenter(selected);
+        int idx = selected;
+        int wsel = idx < Titles.Length ? WidthOf(idx) : 40;
+        var ur = new RectangleF(underX - wsel / 2f, Height - 4, wsel, 3);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var b = new SolidBrush(th.Accent)) g.FillRectangle(b, ur);
+    }
+}
+
+// Слой эффектов курсора: красное свечение и кольцо при клике, поверх окна.
+class CursorOverlay : Form
+{
+    readonly Theme th;
+    readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 20 };
+    float ringR, ringA;
+    bool ringOn, shown, dirty = true;
+    Point halo = new Point(-999, -999);
+
+    public CursorOverlay(Theme theme)
+    {
+        th = theme;
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        TopMost = true;
+        StartPosition = FormStartPosition.Manual;
+        BackColor = Color.Black;
+        Size = new Size(1, 1);
+        timer.Tick += delegate { Frame(); };
+    }
+
+    protected override bool ShowWithoutActivation { get { return true; } }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= 0x80000 | 0x20 | 0x80 | 0x08000000; // LAYERED | TRANSPARENT | TOOLWINDOW | NOACTIVATE
+            return cp;
+        }
+    }
+
+    public void Pulse()
+    {
+        ringOn = true; ringR = 4; ringA = 0.85f; dirty = true;
+        if (!timer.Enabled) timer.Start();
+    }
+
+    public void Follow(Rectangle screen)
+    {
+        if (Bounds != screen) { Bounds = screen; dirty = true; }
+        if (!shown) { Show(); shown = true; }
+        if (!timer.Enabled) timer.Start();
+    }
+
+    public void Stop()
+    {
+        timer.Stop();
+        if (shown) { Hide(); shown = false; }
+    }
+
+    void Frame()
+    {
+        bool active = Ui.Effects && Owner != null && Owner.WindowState != FormWindowState.Minimized && Form.ActiveForm == Owner;
+        Point sp = Cursor.Position;
+        bool inside = active && ClientRectangle.Contains(PointToClient(sp));
+        if (!inside && !ringOn)
+        {
+            if (shown) { Hide(); shown = false; }
+            timer.Stop();
+            return;
+        }
+        if (inside)
+        {
+            var np = PointToClient(sp);
+            if (np != halo) { halo = np; dirty = true; }
+        }
+        if (ringOn) { ringR += 7f; ringA -= 0.06f; if (ringA <= 0) ringOn = false; }
+        if (!dirty && !ringOn) return;
+        dirty = false;
+        Render(inside);
+    }
+
+    void Render(bool drawHalo)
+    {
+        int w = Math.Max(1, Width), h = Math.Max(1, Height);
+        dirty = false;
+        try
+        {
+            using (var bmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb))
+            {
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.Clear(Color.Transparent);
+                    if (drawHalo && Ui.Effects)
+                    {
+                        for (int i = 3; i >= 1; i--)
+                        {
+                            int r = 6 + i * 5;
+                            int a = 26 - i * 5;
+                            using (var b = new SolidBrush(Color.FromArgb(a, th.Accent)))
+                                g.FillEllipse(b, halo.X - r, halo.Y - r, r * 2, r * 2);
+                        }
+                    }
+                    if (ringOn)
+                    {
+                        int r = (int)ringR;
+                        using (var p = new Pen(Color.FromArgb((int)(160 * Math.Max(0, ringA)), th.Accent), 2f))
+                            g.DrawEllipse(p, halo.X - r, halo.Y - r, r * 2, r * 2);
+                    }
+                }
+                Present(bmp);
+            }
+        }
+        catch { Ui.Effects = false; timer.Stop(); if (shown) Hide(); shown = false; }
+    }
+
+    [StructLayout(LayoutKind.Sequential)] struct POINT { public int x, y; }
+    [StructLayout(LayoutKind.Sequential)] struct SIZE2 { public int cx, cy; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct BLENDFUNCTION { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
+
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+    [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst,
+        ref POINT pptDst, ref SIZE2 psize, IntPtr hdcSrc, ref POINT pptSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr hDC);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hDC, IntPtr h);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr h);
+
+    void Present(Bitmap bmp)
+    {
+        IntPtr screen = GetDC(IntPtr.Zero);
+        IntPtr mem = CreateCompatibleDC(screen);
+        IntPtr hbmp = bmp.GetHbitmap(Color.FromArgb(0));
+        IntPtr old = SelectObject(mem, hbmp);
+        try
+        {
+            var size = new SIZE2 { cx = bmp.Width, cy = bmp.Height };
+            var src = new POINT { x = 0, y = 0 };
+            var dst = new POINT { x = Left, y = Top };
+            var blend = new BLENDFUNCTION { BlendOp = 0, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = 1 };
+            if (!UpdateLayeredWindow(Handle, screen, ref dst, ref size, mem, ref src, 0, ref blend, 2))
+            {
+                Ui.Effects = false;
+                timer.Stop();
+                if (shown) Hide();
+                shown = false;
+            }
+        }
+        finally
+        {
+            SelectObject(mem, old);
+            DeleteObject(hbmp);
+            DeleteDC(mem);
+            ReleaseDC(IntPtr.Zero, screen);
+        }
+    }
+}
+
+class MainForm : Form, IMessageFilter
 {
     readonly Theme th = Theme.Current();
+    readonly Font fSmall = new Font("Segoe UI", 8f);
+    readonly Font fSmallB = new Font("Segoe UI Semibold", 8.5f);
     readonly TextBox txtSearch = new TextBox(), txtUrl = new TextBox(), txtName = new TextBox();
     readonly ListBox lst = new ListBox();
+    readonly ToolTip tip = new ToolTip();
     readonly ComboBox cmbVpn = new ComboBox();
-    readonly CheckBox chkFirewall = new CheckBox();
+    ToggleSwitch chkFirewall;
     readonly PictureBox pic = new PictureBox();
     readonly Label lblStatus = new Label(), lblTarget = new Label();
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 1000 };
-    readonly TabControl tabs = new TabControl();
-    readonly TabPage pageApps = new TabPage("Приложения");
-    readonly TabPage pageRules = new TabPage("Правила брандмауэра");
+    readonly Panel pageApps = new Panel(), pageRules = new Panel();
+    TabStrip tabStrip;
+    CursorOverlay overlay;
     readonly ListBox lstRules = new ListBox();
     readonly Label lblRulesStatus = new Label();
     readonly TextBox txtRuleProgram = new TextBox(), txtRuleIfaces = new TextBox();
     readonly ComboBox cmbRuleAction = new ComboBox(), cmbRuleVpn = new ComboBox();
-    readonly CheckBox chkRuleEnabled = new CheckBox();
-    Button btnToggleApp;
+    ToggleSwitch chkRuleEnabled;
+    AnimButton btnToggleApp;
+    volatile bool rulesLoading;
 
     List<FwRule> rules = new List<FwRule>();
     readonly Dictionary<string, List<FwRule>> rulesByProgram = new Dictionary<string, List<FwRule>>(StringComparer.OrdinalIgnoreCase);
@@ -475,10 +1007,11 @@ class MainForm : Form
     Thread iconThread;
     DateTime lastLoad;
     string target;
+    int hoverApp = -1, hoverRule = -1;
 
-    public MainForm()
+    public MainForm(bool startRules = false)
     {
-        Text = Program.AppName + " — приложения и правила брандмауэра (v3)";
+        Text = Program.AppName + " — приложения и правила брандмауэра (v3.0.1)";
         Font = new Font("Segoe UI", 10f);
         ClientSize = new Size(460, 704);
         FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -488,27 +1021,31 @@ class MainForm : Form
         ForeColor = th.Text;
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
+        Ui.InitCursors();
+        Cursor = Ui.Arrow;
+        chkFirewall = new ToggleSwitch(th);
+        chkRuleEnabled = new ToggleSwitch(th);
+
         Put(new Label { Text = Program.AppName, AutoSize = true, Font = new Font("Segoe UI Semibold", 18f) }, 18, 12);
         var sub = new Label
         {
-            Text = "Запускает приложения только при включённом VPN. Создайте ярлык — без VPN программа не откроется. " +
-                   "Включите ограничение через брандмауэр, чтобы программа не имела сети даже при прямом запуске .exe.",
-            ForeColor = th.Muted, Font = new Font("Segoe UI", 9f)
+            Text = "Сеть только через VPN. Ограничение — на уровне брандмауэра Windows.",
+            ForeColor = th.Muted, Font = fSmall
         };
-        sub.SetBounds(20, 50, 420, 48);
+        sub.SetBounds(20, 52, 420, 20);
         Controls.Add(sub);
 
-        lblStatus.SetBounds(20, 92, 420, 22);
+        lblStatus.SetBounds(20, 78, 420, 22);
         Controls.Add(lblStatus);
 
-        Input(txtSearch, 20, 124, 376, "Поиск приложения");
+        Input(txtSearch, 20, 108, 376, "Поиск приложения");
         var btnRefresh = FlatButton("⟳", false);
-        btnRefresh.SetBounds(404, 124, 36, 36);
+        btnRefresh.SetBounds(404, 108, 36, 36);
         btnRefresh.Font = new Font("Segoe UI", 12f);
-        new ToolTip().SetToolTip(btnRefresh, "Обновить список приложений");
+        tip.SetToolTip(btnRefresh, "Обновить список приложений");
         Controls.Add(btnRefresh);
 
-        var listFrame = Frame(20, 168, 420, 232);
+        var listFrame = Frame(20, 152, 420, 244);
         lst.BorderStyle = BorderStyle.None;
         lst.BackColor = th.Surface;
         lst.ForeColor = th.Text;
@@ -526,42 +1063,42 @@ class MainForm : Form
         pic.SetBounds(20, 462, 24, 24);
         pic.SizeMode = PictureBoxSizeMode.Zoom;
         Controls.Add(pic);
-        lblTarget.SetBounds(50, 464, 248, 22);
+        lblTarget.SetBounds(50, 464, 236, 22);
         lblTarget.ForeColor = th.Muted;
         lblTarget.AutoEllipsis = true;
         lblTarget.Text = "Ничего не выбрано";
         Controls.Add(lblTarget);
 
         var btnFolder = FlatButton("Папка", false);
-        btnFolder.SetBounds(304, 460, 70, 30);
-        btnFolder.Font = new Font("Segoe UI", 9f);
-        new ToolTip().SetToolTip(btnFolder, "Открыть папку выбранного приложения");
+        btnFolder.SetBounds(292, 460, 76, 30);
+        btnFolder.Font = fSmall;
+        tip.SetToolTip(btnFolder, "Открыть папку выбранного приложения");
         btnFolder.Click += delegate { OpenAppFolder(); };
         Controls.Add(btnFolder);
 
-        btnToggleApp = FlatButton("Вкл/Выкл", false);
-        btnToggleApp.SetBounds(380, 460, 60, 30);
-        btnToggleApp.Font = new Font("Segoe UI", 9f);
-        new ToolTip().SetToolTip(btnToggleApp, "Включить или выключить ограничение брандмауэра для приложения");
+        btnToggleApp = (AnimButton)FlatButton("Выкл.", false);
+        btnToggleApp.SetBounds(372, 460, 68, 30);
+        btnToggleApp.Font = fSmall;
+        tip.SetToolTip(btnToggleApp, "Включить или выключить ограничение брандмауэра для приложения");
         btnToggleApp.Click += delegate { ToggleAppRestriction(); };
         Controls.Add(btnToggleApp);
 
         Input(txtName, 20, 496, 420, "Название ярлыка");
 
         chkFirewall.SetBounds(20, 540, 282, 34);
-        chkFirewall.Text = "Только через VPN (брандмауэр Windows)";
+        chkFirewall.Text = "Только через VPN (брандмауэр)";
         chkFirewall.ForeColor = th.Text;
         chkFirewall.FlatStyle = FlatStyle.Flat;
         chkFirewall.Font = new Font("Segoe UI", 9f);
         chkFirewall.Checked = true;
-        new ToolTip().SetToolTip(chkFirewall,
+        tip.SetToolTip(chkFirewall,
             "Создать правила брандмауэра: без VPN у программы нет сети, даже если запустить .exe напрямую. Понадобятся права администратора.");
         Controls.Add(chkFirewall);
 
         var btnFwRemove = FlatButton("Удалить правила", false);
         btnFwRemove.SetBounds(306, 540, 134, 30);
         btnFwRemove.Font = new Font("Segoe UI", 9f);
-        new ToolTip().SetToolTip(btnFwRemove, "Удалить правила брандмауэра для выбранной программы");
+        tip.SetToolTip(btnFwRemove, "Удалить правила брандмауэра для выбранной программы");
         btnFwRemove.Click += delegate { RemoveFirewall(); };
         Controls.Add(btnFwRemove);
 
@@ -598,6 +1135,12 @@ class MainForm : Form
 
         txtSearch.TextChanged += delegate { Filter(); };
         lst.DrawItem += DrawApp;
+        lst.MouseMove += delegate
+        {
+            int i = lst.IndexFromPoint(lst.PointToClient(Cursor.Position));
+            if (i != hoverApp) { hoverApp = i; lst.Invalidate(); }
+        };
+        lst.MouseLeave += delegate { if (hoverApp != -1) { hoverApp = -1; lst.Invalidate(); } };
         lst.SelectedIndexChanged += delegate
         {
             var a = lst.SelectedItem as AppEntry;
@@ -622,43 +1165,113 @@ class MainForm : Form
         btnCreate.Click += delegate { Create(); };
         Shown += delegate { cmbVpn.Select(0, 0); txtSearch.Focus(); };
 
-        // ---- вкладки (версия 3): всё существующее содержимое становится первой вкладкой ----
+        // ---- шапка: кастомные вкладки и переключатель эффектов ----
         pageApps.BackColor = th.Back;
+        pageRules.BackColor = th.Back;
         var holder = new Panel { Dock = DockStyle.Fill, BackColor = th.Back };
         foreach (var c in Controls.Cast<Control>().ToList()) holder.Controls.Add(c);
         pageApps.Controls.Add(holder);
 
         BuildRulesPage();
-        tabs.Dock = DockStyle.Fill;
-        tabs.Controls.Add(pageApps);
-        tabs.Controls.Add(pageRules);
-        Controls.Add(tabs);
-        tabs.SelectedIndexChanged += delegate
+
+        pageApps.Dock = DockStyle.Fill;
+        pageRules.Dock = DockStyle.Fill;
+        pageRules.Visible = false;
+        var body = new Panel { Dock = DockStyle.Fill, BackColor = th.Back };
+        body.Controls.Add(pageApps);
+        body.Controls.Add(pageRules);
+
+        tabStrip = new TabStrip(th) { Titles = new[] { "Приложения", "Правила" }, Dock = DockStyle.Fill };
+        var effects = new AnimButton(th, false) { Text = "Эффекты", Dock = DockStyle.Right, Width = 96, Font = fSmall };
+        tip.SetToolTip(effects, "Красное свечение и кольцо вокруг курсора");
+        effects.Click += delegate { ToggleEffects(effects); };
+
+        var header = new Panel { Dock = DockStyle.Top, Height = 42, BackColor = th.Back };
+        header.Controls.Add(tabStrip);
+        header.Controls.Add(effects);
+
+        Controls.Add(body);
+        Controls.Add(header);
+
+        tabStrip.SelectedChanged += delegate
         {
-            if (tabs.SelectedTab == pageRules) LoadRules();
+            bool rulesTab = tabStrip.SelectedIndex == 1;
+            pageApps.Visible = !rulesTab;
+            pageRules.Visible = rulesTab;
+            if (rulesTab) LoadRules();
             else RefreshToggleButton();
         };
 
+        // Слой эффектов курсора: поверх окна, клики проходят насквозь.
+        try
+        {
+            overlay = new CursorOverlay(th) { Owner = this };
+            Application.AddMessageFilter(this);
+            Move += delegate { if (overlay != null) overlay.Follow(Bounds); };
+            Resize += delegate { if (overlay != null) overlay.Follow(Bounds); };
+            Activated += delegate { if (overlay != null) overlay.Follow(Bounds); };
+            Deactivate += delegate { if (overlay != null) overlay.Stop(); };
+        }
+        catch { overlay = null; }
+
         LoadRules();
         RefreshToggleButton();
+        if (startRules) tabStrip.SelectedIndex = 1;
+    }
+
+    // Переключение эффектов курсора из шапки.
+    void ToggleEffects(AnimButton b)
+    {
+        Ui.Effects = !Ui.Effects;
+        b.Text = Ui.Effects ? "Эффекты" : "Без эффектов";
+        if (overlay == null) return;
+        if (Ui.Effects) overlay.Follow(Bounds); else overlay.Stop();
+    }
+
+    // Перехват кликов по любым дочерним контролам для кольца у курсора.
+    bool IMessageFilter.PreFilterMessage(ref Message m)
+    {
+        if (overlay == null || !Ui.Effects || Form.ActiveForm != this) return false;
+        if (m.Msg == 0x200) { overlay.Follow(Bounds); return false; }   // WM_MOUSEMOVE — будим слой
+        if (m.Msg == 0x201 && Bounds.Contains(Cursor.Position)) overlay.Pulse();
+        return false;
     }
 
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        if (th.Dark)
+        int on = 1;
+        DwmSetWindowAttribute(Handle, 20, ref on, 4);   // тёмный заголовок
+        DwmSetWindowAttribute(Handle, 19, ref on, 4);   // тёмная рамка
+        SetCaptionColor();
+        SetWindowTheme(lst.Handle, "DarkMode_Explorer", null);
+        SetWindowTheme(lstRules.Handle, "DarkMode_Explorer", null);
+        SetWindowTheme(cmbVpn.Handle, "DarkMode_CFD", null);
+        SetWindowTheme(cmbRuleAction.Handle, "DarkMode_CFD", null);
+        SetWindowTheme(cmbRuleVpn.Handle, "DarkMode_CFD", null);
+    }
+
+    // Чёрный заголовок и красная рамка окна (Windows 11; на Windows 10 молча игнорируется).
+    void SetCaptionColor()
+    {
+        try
         {
-            int on = 1;
-            DwmSetWindowAttribute(Handle, 20, ref on, 4); // тёмный заголовок окна
-            SetWindowTheme(lst.Handle, "DarkMode_Explorer", null);
-            SetWindowTheme(cmbVpn.Handle, "DarkMode_CFD", null);
+            int caption = 0x000A0A0A; // COLORREF BGR
+            int text = 0x00F2F2F2;
+            int borderCol = 0x002E1DE1;
+            DwmSetWindowAttribute(Handle, 35, ref caption, 4);
+            DwmSetWindowAttribute(Handle, 36, ref text, 4);
+            DwmSetWindowAttribute(Handle, 34, ref borderCol, 4);
         }
+        catch { }
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         NetworkChange.NetworkAddressChanged -= OnNetworkChanged;
         NetworkChange.NetworkAvailabilityChanged -= OnNetworkChanged;
+        try { Application.RemoveMessageFilter(this); } catch { }
+        if (overlay != null) { try { overlay.Dispose(); } catch { } overlay = null; }
         base.OnFormClosed(e);
     }
 
@@ -698,14 +1311,7 @@ class MainForm : Form
 
     Button FlatButton(string text, bool primary)
     {
-        var b = new Button { Text = text, FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand, UseVisualStyleBackColor = false };
-        b.BackColor = primary ? th.Accent : th.Surface;
-        b.ForeColor = primary ? Color.White : th.Text;
-        b.FlatAppearance.BorderColor = primary ? th.Accent : th.Border;
-        b.FlatAppearance.BorderSize = primary ? 0 : 1;
-        b.FlatAppearance.MouseOverBackColor = primary ? th.AccentHover : th.Select;
-        b.FlatAppearance.MouseDownBackColor = primary ? th.AccentHover : th.Select;
-        return b;
+        return new AnimButton(th, primary) { Text = text };
     }
 
     // ---- VPN ----
@@ -731,8 +1337,8 @@ class MainForm : Form
         string a = cmbVpn.Text.Trim();
         if (a.Length == 0) { lblStatus.Text = "●  Укажите VPN-адаптер"; lblStatus.ForeColor = th.Muted; return; }
         bool up = Program.VpnUp(a);
-        lblStatus.Text = up ? "●  " + a + " подключён" : "●  " + a + " не подключён";
-        lblStatus.ForeColor = up ? th.Accent : th.Bad;
+        lblStatus.Text = up ? "●  " + a + " — подключён" : "○  " + a + " — не подключён";
+        lblStatus.ForeColor = up ? th.Accent : th.Muted;
     }
 
     // ---- приложения ----
@@ -821,7 +1427,13 @@ class MainForm : Form
         if (e.Index < 0) return;
         var a = (AppEntry)lst.Items[e.Index];
         bool selected = (e.State & DrawItemState.Selected) != 0;
-        using (var b = new SolidBrush(selected ? th.Select : th.Surface)) e.Graphics.FillRectangle(b, e.Bounds);
+        bool hover = e.Index == hoverApp && !selected;
+        using (var b = new SolidBrush(selected ? th.AccentDim : (hover ? th.SurfaceHover : th.Surface)))
+            e.Graphics.FillRectangle(b, e.Bounds);
+        if (selected)
+            using (var bar = new SolidBrush(th.Accent))
+                e.Graphics.FillRectangle(bar, e.Bounds.X, e.Bounds.Y, 3, e.Bounds.Height);
+
         Bitmap ic;
         lock (icons) icons.TryGetValue(a.Target, out ic);
         if (ic != null)
@@ -829,15 +1441,27 @@ class MainForm : Form
             e.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
             e.Graphics.DrawImage(ic, e.Bounds.X + 12, e.Bounds.Y + 7, 24, 24);
         }
-        var r = new Rectangle(e.Bounds.X + 46, e.Bounds.Y, e.Bounds.Width - 52, e.Bounds.Height);
+        var r = new Rectangle(e.Bounds.X + 46, e.Bounds.Y, e.Bounds.Width - 74, e.Bounds.Height);
         TextRenderer.DrawText(e.Graphics, a.Name, lst.Font, r, th.Text,
             TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+
         var rr = RulesFor(a.Target);
         if (rr != null && rr.Count > 0)
         {
             bool anyOn = rr.Any(x => x.Enabled);
-            using (var br = new SolidBrush(anyOn ? th.Accent : th.Bad))
-                e.Graphics.FillEllipse(br, e.Bounds.Right - 17, e.Bounds.Y + 14, 10, 10);
+            int cx = e.Bounds.Right - 18, cy = e.Bounds.Y + e.Bounds.Height / 2;
+            if (anyOn)
+            {
+                using (var glow = new SolidBrush(Color.FromArgb(70, th.Accent)))
+                    e.Graphics.FillEllipse(glow, cx - 4, cy - 8, 16, 16);
+                using (var dot = new SolidBrush(th.Accent))
+                    e.Graphics.FillEllipse(dot, cx, cy - 4, 8, 8);
+            }
+            else
+            {
+                using (var ring = new Pen(th.Muted, 1.4f))
+                    e.Graphics.DrawEllipse(ring, cx, cy - 4, 8, 8);
+            }
         }
     }
 
@@ -933,10 +1557,16 @@ class MainForm : Form
         lstRules.SetBounds(1, 1, 418, 212);
         frame.Controls.Add(lstRules);
         lstRules.DrawItem += DrawRule;
+        lstRules.MouseMove += delegate
+        {
+            int i = lstRules.IndexFromPoint(lstRules.PointToClient(Cursor.Position));
+            if (i != hoverRule) { hoverRule = i; lstRules.Invalidate(); }
+        };
+        lstRules.MouseLeave += delegate { if (hoverRule != -1) { hoverRule = -1; lstRules.Invalidate(); } };
         lstRules.SelectedIndexChanged += delegate { FillRuleEdit(lstRules.SelectedItem as FwRule); };
 
         var bRefresh = FlatButton("⟳", false); bRefresh.Font = new Font("Segoe UI", 12f);
-        new ToolTip().SetToolTip(bRefresh, "Обновить список правил");
+        tip.SetToolTip(bRefresh, "Обновить список правил");
         bRefresh.Click += delegate { LoadRules(); };
         put(bRefresh, 20, 286, 36, 30);
 
@@ -953,7 +1583,7 @@ class MainForm : Form
         put(bDel, 274, 286, 100, 30);
 
         var bDir = FlatButton("Папка", false); bDir.Font = new Font("Segoe UI", 9f);
-        new ToolTip().SetToolTip(bDir, "Открыть папку программы выбранного правила");
+        tip.SetToolTip(bDir, "Открыть папку программы выбранного правила");
         bDir.Click += delegate
         {
             var r = lstRules.SelectedItem as FwRule;
@@ -998,7 +1628,7 @@ class MainForm : Form
         cmbRuleVpn.Font = new Font("Segoe UI", 9f);
         put(cmbRuleVpn, 140, 432, 160, 28);
 
-        chkRuleEnabled.Text = "Правило включено";
+        chkRuleEnabled.Text = "Включено";
         chkRuleEnabled.ForeColor = th.Text;
         chkRuleEnabled.FlatStyle = FlatStyle.Flat;
         chkRuleEnabled.Font = new Font("Segoe UI", 9f);
@@ -1051,14 +1681,33 @@ class MainForm : Form
 
     void LoadRules()
     {
-        rules = Program.ReadFwRules();
+        if (rulesLoading) return;
+        rulesLoading = true;
+        lblRulesStatus.Text = "Загрузка правил…";
+        ThreadPool.QueueUserWorkItem(delegate
+        {
+            List<FwRule> list = null;
+            try { list = Program.ReadFwRules(); } catch { }
+            try
+            {
+                if (!IsDisposed && IsHandleCreated) BeginInvoke((Action)delegate { ApplyRules(list); });
+                else rulesLoading = false;
+            }
+            catch { rulesLoading = false; }
+        });
+    }
+
+    void ApplyRules(List<FwRule> list)
+    {
+        rulesLoading = false;
+        rules = list ?? new List<FwRule>();
         rulesByProgram.Clear();
         foreach (var r in rules)
             if (!string.IsNullOrEmpty(r.Program))
             {
-                List<FwRule> list;
-                if (!rulesByProgram.TryGetValue(r.Program, out list)) rulesByProgram[r.Program] = list = new List<FwRule>();
-                list.Add(r);
+                List<FwRule> l;
+                if (!rulesByProgram.TryGetValue(r.Program, out l)) rulesByProgram[r.Program] = l = new List<FwRule>();
+                l.Add(r);
             }
         LoadApps(); // подтянуть .exe, которых нет в меню «Пуск», но у которых есть правила
         RefreshRulesList();
@@ -1087,16 +1736,25 @@ class MainForm : Form
         if (e.Index < 0) return;
         var r = (FwRule)lstRules.Items[e.Index];
         bool sel = (e.State & DrawItemState.Selected) != 0;
-        using (var b = new SolidBrush(sel ? th.Select : th.Surface)) e.Graphics.FillRectangle(b, e.Bounds);
-        using (var br = new SolidBrush(r.IsBlock ? th.Bad : th.Accent))
-            e.Graphics.FillRectangle(br, e.Bounds.X + 8, e.Bounds.Y + 10, 13, 13);
+        bool hover = e.Index == hoverRule && !sel;
+        using (var b = new SolidBrush(sel ? th.AccentDim : (hover ? th.SurfaceHover : th.Surface)))
+            e.Graphics.FillRectangle(b, e.Bounds);
+        if (sel)
+            using (var bar = new SolidBrush(th.Accent))
+                e.Graphics.FillRectangle(bar, e.Bounds.X, e.Bounds.Y, 3, e.Bounds.Height);
+
+        Color sq = r.IsBlock ? th.Accent : th.Text;
+        if (!r.Enabled) sq = th.Muted;
+        using (var br = new SolidBrush(sq))
+            e.Graphics.FillRectangle(br, e.Bounds.X + 10, e.Bounds.Y + 10, 13, 13);
+
         string prog = string.IsNullOrEmpty(r.Program) ? "?" : Path.GetFileName(r.Program);
-        TextRenderer.DrawText(e.Graphics, prog + "   ·   " + r.Action, lstRules.Font,
-            new Rectangle(e.Bounds.X + 28, e.Bounds.Y + 1, e.Bounds.Width - 34, 17),
+        TextRenderer.DrawText(e.Graphics, prog + "   ·   " + r.Action, fSmallB,
+            new Rectangle(e.Bounds.X + 30, e.Bounds.Y + 1, e.Bounds.Width - 36, 17),
             r.Enabled ? th.Text : th.Muted, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
-        string sub = (r.Enabled ? "вкл" : "ВЫКЛ") + "   ·   " + r.InterfaceText + "   ·   " + r.Name;
-        TextRenderer.DrawText(e.Graphics, sub, new Font("Segoe UI", 8f),
-            new Rectangle(e.Bounds.X + 28, e.Bounds.Y + 17, e.Bounds.Width - 34, 16),
+        string sub = (r.Enabled ? "вкл" : "выкл") + "   ·   " + r.InterfaceText + "   ·   " + r.Name;
+        TextRenderer.DrawText(e.Graphics, sub, fSmall,
+            new Rectangle(e.Bounds.X + 30, e.Bounds.Y + 17, e.Bounds.Width - 36, 16),
             th.Muted, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
     }
 

@@ -1,4 +1,4 @@
-﻿# Сборка «Тоннеля»: рисует иконку и компилирует Tunnel.exe встроенным csc
+﻿# Сборка «Тоннеля»: рисует иконку и компилирует TunnelFW.exe встроенным csc
 $src = $PSScriptRoot
 $out = Split-Path $src
 Add-Type -AssemblyName System.Drawing
@@ -12,10 +12,10 @@ function New-IconPng([int]$s) {
     $path.AddArc(0, 0, $d, $d, 180, 90); $path.AddArc($s - $d - 1, 0, $d, $d, 270, 90)
     $path.AddArc($s - $d - 1, $s - $d - 1, $d, $d, 0, 90); $path.AddArc(0, $s - $d - 1, $d, $d, 90, 90)
     $path.CloseFigure()
-    $grad = New-Object Drawing.Drawing2D.LinearGradientBrush (New-Object Drawing.Point 0, 0), (New-Object Drawing.Point $s, $s), ([Drawing.Color]::FromArgb(34, 197, 94)), ([Drawing.Color]::FromArgb(21, 128, 61))
+    $grad = New-Object Drawing.Drawing2D.LinearGradientBrush (New-Object Drawing.Point 0, 0), (New-Object Drawing.Point $s, $s), ([Drawing.Color]::FromArgb(22, 22, 22)), ([Drawing.Color]::FromArgb(92, 12, 20))
     $g.FillPath($grad, $path)
     # Арка тоннеля
-    $pen = New-Object Drawing.Pen ([Drawing.Color]::White), ([Math]::Max(1.6, $s * 0.1))
+    $pen = New-Object Drawing.Pen ([Drawing.Color]::FromArgb(225, 29, 46)), ([Math]::Max(1.6, $s * 0.1))
     $pen.StartCap = 'Round'; $pen.EndCap = 'Round'
     $x = $s * 0.24; $w = $s * 0.52; $top = $s * 0.24; $bottom = $s * 0.76
     $g.DrawArc($pen, $x, $top, $w, $w, 180, 180)
